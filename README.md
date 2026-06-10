@@ -1,6 +1,6 @@
 # Network Flow Activity Field Viewer for Zigbee PCAPs
 
-This repository contains a lightweight exporter for the workflow where SOC analysts turn Zigbee PCAP-derived activity rows into ParaView-ready fields. It is designed for CSVs produced by notebook pipelines that normalize encrypted Zigbee activity columns such as `time_rel`, `LayerZBEENWKSource`, `LayerZBEENWKDestination`, `PacketLength`, `Data_size`, RSSI/LQI values, IEEE 802.15.4 fields, Zigbee NWK fields, and Zigbee security fields.
+This repository contains a lightweight exporter for the workflow where analysts can turn Zigbee PCAP-derived activity rows into ParaView-ready fields. It is designed for CSVs produced by notebook pipelines that normalize encrypted Zigbee activity columns such as `time_rel`, `LayerZBEENWKSource`, `LayerZBEENWKDestination`, `PacketLength`, `Data_size`, RSSI/LQI values, IEEE 802.15.4 fields, Zigbee NWK fields, and Zigbee security fields.
 
 The default dataset mapping is activity-centric rather than binary-classification centric:
 
