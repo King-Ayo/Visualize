@@ -2,7 +2,7 @@
 
 The exporter intentionally uses only the Python standard library so it can run
 inside capture-processing notebooks or SOC sandboxes before heavier scientific
-packages are installed.  It accepts CSVs produced from pandas pipelines and emits
+packages are installed. It accepts CSVs produced from pandas pipelines and emits
 CSV, VTP point clouds, and VTI activity volumes that ParaView can load directly.
 """
 
@@ -31,17 +31,18 @@ _DEFAULT_SCORE_COLUMNS = (
     "isolation_forest_score",
     "transformer_ids_score",
     "attention_weight",
-    "target",
 )
 
 
 @dataclass(frozen=True)
 class ExportConfig:
-    """Options for mapping tabular Zigbee traffic into visualization fields."""
+    """Options for mapping tabular Zigbee activity into visualization fields."""
 
     time_column: str = "time_rel"
     source_column: str = "LayerZBEENWKSource"
     destination_column: str = "LayerZBEENWKDestination"
+    length_column: str = "PacketLength"
+    target_column: str = "target"
     score_column: str | None = None
     volume_bins: tuple[int, int, int] = (96, 32, 32)
 
@@ -54,7 +55,8 @@ def export_activity_fields(input_csv: Path, output_dir: Path, config: ExportConf
         raise ValueError(f"No rows found in {input_csv}")
 
     score_column = config.score_column or _choose_score_column(rows[0])
-    points = [_row_to_point(row, config, score_column) for row in rows]
+    activity_lookup = _activity_lookup(rows, config.target_column)
+    points = [_row_to_point(row, config, score_column, activity_lookup) for row in rows]
     _normalize_points(points)
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -75,19 +77,36 @@ def _read_csv(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
-def _choose_score_column(header_row: dict[str, str]) -> str:
+def _choose_score_column(header_row: dict[str, str]) -> str | None:
     for name in _DEFAULT_SCORE_COLUMNS:
         if name in header_row:
             return name
-    return "activity_score"
+    return None
 
 
-def _row_to_point(row: dict[str, str], config: ExportConfig, score_column: str) -> dict[str, float | str]:
+def _activity_lookup(rows: list[dict[str, str]], target_column: str) -> dict[str, int]:
+    labels: dict[str, int] = {}
+    for row in rows:
+        label = _activity_label(row, target_column)
+        if label not in labels:
+            labels[label] = len(labels)
+    return labels
+
+
+def _row_to_point(
+    row: dict[str, str],
+    config: ExportConfig,
+    score_column: str | None,
+    activity_lookup: dict[str, int],
+) -> dict[str, float | str]:
     source = _first_text(row, config.source_column, _ADDRESS_COLUMNS) or "src_unknown"
     destination = _first_text(row, config.destination_column, _ADDRESS_COLUMNS) or "dst_unknown"
     time_value = _as_float(row.get(config.time_column), default=0.0)
-    score = _score_value(row.get(score_column), row.get("target"))
-    packet_length = _as_float(row.get("PacketLength"), default=_as_float(row.get("Data_size"), default=0.0))
+    activity_label = _activity_label(row, config.target_column)
+    activity_id = float(activity_lookup[activity_label])
+    score = _score_value(row.get(score_column)) if score_column else math.nan
+    color_value = score if not math.isnan(score) else activity_id
+    packet_length = _as_float(row.get(config.length_column), default=_as_float(row.get("Data_size"), default=0.0))
     delta = _as_float(row.get("Timedeltafrompreviouscapturedframe"), default=0.0)
 
     return {
@@ -96,13 +115,25 @@ def _row_to_point(row: dict[str, str], config: ExportConfig, score_column: str) 
         "z": _stable_unit_hash(destination),
         "t": time_value,
         "score": score,
+        "color_value": color_value,
+        "activity_id": activity_id,
         "packet_length": packet_length,
         "packet_rate": 1.0 / max(delta, 1.0e-6) if delta >= 0.0 else 0.0,
         "source": source,
         "destination": destination,
         "protocol_family": _protocol_family(row),
-        "label": str(row.get("target") or row.get("label_source") or "unknown"),
+        "activity_label": activity_label,
     }
+
+
+def _activity_label(row: dict[str, str], target_column: str) -> str:
+    value = row.get(target_column)
+    if value is not None and str(value).strip():
+        return str(value).strip()
+    value = row.get("label_source")
+    if value is not None and str(value).strip():
+        return str(value).strip()
+    return "unknown_activity"
 
 
 def _first_text(row: dict[str, str], preferred: str, fallbacks: tuple[str, ...]) -> str:
@@ -122,22 +153,14 @@ def _stable_unit_hash(value: str) -> float:
 def _as_float(value: str | None, default: float = math.nan) -> float:
     if value is None or str(value).strip() == "":
         return default
-    text = str(value).strip().lower()
-    if text in {"true", "yes", "attack", "malicious", "anomaly"}:
-        return 1.0
-    if text in {"false", "no", "benign", "normal"}:
-        return 0.0
     try:
-        return float(text)
+        return float(str(value).strip())
     except ValueError:
         return default
 
 
-def _score_value(raw_score: str | None, raw_target: str | None) -> float:
-    numeric = _as_float(raw_score)
-    if not math.isnan(numeric):
-        return numeric
-    return _as_float(raw_target, default=0.0)
+def _score_value(raw_score: str | None) -> float:
+    return _as_float(raw_score, default=math.nan)
 
 
 def _protocol_family(row: dict[str, str]) -> str:
@@ -151,9 +174,11 @@ def _protocol_family(row: dict[str, str]) -> str:
 
 
 def _normalize_points(points: list[dict[str, float | str]]) -> None:
-    for axis in ("x", "score", "packet_length", "packet_rate"):
+    for axis in ("x", "score", "color_value", "packet_length", "packet_rate"):
         values = [float(point[axis]) for point in points if not math.isnan(float(point[axis]))]
         if not values:
+            for point in points:
+                point[f"{axis}_norm"] = math.nan
             continue
         minimum = min(values)
         maximum = max(values)
@@ -161,8 +186,9 @@ def _normalize_points(points: list[dict[str, float | str]]) -> None:
         for point in points:
             value = float(point[axis])
             if math.isnan(value):
-                value = minimum
-            point[f"{axis}_norm"] = 0.0 if scale == 0.0 else (value - minimum) / scale
+                point[f"{axis}_norm"] = math.nan
+            else:
+                point[f"{axis}_norm"] = 0.0 if scale == 0.0 else (value - minimum) / scale
 
 
 def _write_point_csv(path: Path, points: list[dict[str, float | str]]) -> None:
@@ -173,6 +199,9 @@ def _write_point_csv(path: Path, points: list[dict[str, float | str]]) -> None:
         "t",
         "score",
         "score_norm",
+        "color_value",
+        "color_value_norm",
+        "activity_id",
         "packet_length",
         "packet_length_norm",
         "packet_rate",
@@ -180,12 +209,20 @@ def _write_point_csv(path: Path, points: list[dict[str, float | str]]) -> None:
         "source",
         "destination",
         "protocol_family",
-        "label",
+        "activity_label",
     ]
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(points)
+        writer.writerows(_csv_safe_point(point) for point in points)
+
+
+def _csv_safe_point(point: dict[str, float | str]) -> dict[str, float | str]:
+    safe = dict(point)
+    for key, value in point.items():
+        if isinstance(value, float) and math.isnan(value):
+            safe[key] = ""
+    return safe
 
 
 def _write_vtp(path: Path, points: list[dict[str, float | str]]) -> None:
@@ -200,8 +237,8 @@ def _write_vtp(path: Path, points: list[dict[str, float | str]]) -> None:
         NumberOfStrips="0",
         NumberOfPolys="0",
     )
-    point_data = ET.SubElement(piece, "PointData", Scalars="score_norm")
-    for name in ("score", "score_norm", "packet_length", "packet_rate", "t"):
+    point_data = ET.SubElement(piece, "PointData", Scalars="color_value")
+    for name in ("score", "score_norm", "color_value", "color_value_norm", "activity_id", "packet_length", "packet_rate", "t"):
         ET.SubElement(point_data, "DataArray", type="Float64", Name=name, format="ascii").text = _float_array(points, name)
 
     points_node = ET.SubElement(piece, "Points")
@@ -218,25 +255,31 @@ def _write_vti(path: Path, points: list[dict[str, float | str]], bins: tuple[int
     nx, ny, nz = bins
     cell_count = nx * ny * nz
     counts = [0] * cell_count
-    score_max = [0.0] * cell_count
+    color_max = [0.0] * cell_count
     bytes_sum = [0.0] * cell_count
+    activity_counts: list[dict[int, int]] = [{} for _ in range(cell_count)]
 
     for point in points:
         ix = _bin_index(float(point["x_norm"]), nx)
         iy = _bin_index(float(point["y"]), ny)
         iz = _bin_index(float(point["z"]), nz)
         offset = ix + nx * (iy + ny * iz)
+        activity_id = int(float(point["activity_id"]))
         counts[offset] += 1
-        score_max[offset] = max(score_max[offset], float(point["score_norm"]))
-        bytes_sum[offset] += float(point["packet_length"])
+        color_max[offset] = max(color_max[offset], _safe_float(point["color_value_norm"]))
+        bytes_sum[offset] += _safe_float(point["packet_length"])
+        activity_counts[offset][activity_id] = activity_counts[offset].get(activity_id, 0) + 1
+
+    dominant_activity = [_dominant_activity_id(counts_by_activity) for counts_by_activity in activity_counts]
 
     vtk_file = ET.Element("VTKFile", type="ImageData", version="0.1", byte_order="LittleEndian")
     image = ET.SubElement(vtk_file, "ImageData", WholeExtent=f"0 {nx - 1} 0 {ny - 1} 0 {nz - 1}", Origin="0 0 0", Spacing="1 1 1")
     piece = ET.SubElement(image, "Piece", Extent=f"0 {nx - 1} 0 {ny - 1} 0 {nz - 1}")
-    point_data = ET.SubElement(piece, "PointData", Scalars="score_max")
+    point_data = ET.SubElement(piece, "PointData", Scalars="color_value_max")
     ET.SubElement(point_data, "DataArray", type="Int32", Name="packet_count", format="ascii").text = " ".join(str(value) for value in counts)
-    ET.SubElement(point_data, "DataArray", type="Float64", Name="score_max", format="ascii").text = " ".join(f"{value:.9g}" for value in score_max)
+    ET.SubElement(point_data, "DataArray", type="Float64", Name="color_value_max", format="ascii").text = " ".join(f"{value:.9g}" for value in color_max)
     ET.SubElement(point_data, "DataArray", type="Float64", Name="bytes_sum", format="ascii").text = " ".join(f"{value:.9g}" for value in bytes_sum)
+    ET.SubElement(point_data, "DataArray", type="Int32", Name="dominant_activity_id", format="ascii").text = " ".join(str(value) for value in dominant_activity)
     ET.SubElement(piece, "CellData")
     _write_xml(path, vtk_file)
 
@@ -245,8 +288,21 @@ def _bin_index(value: float, bins: int) -> int:
     return min(max(int(value * bins), 0), bins - 1)
 
 
+def _safe_float(value: float | str) -> float:
+    numeric = float(value)
+    if math.isnan(numeric):
+        return 0.0
+    return numeric
+
+
+def _dominant_activity_id(counts_by_activity: dict[int, int]) -> int:
+    if not counts_by_activity:
+        return -1
+    return max(counts_by_activity.items(), key=lambda item: (item[1], -item[0]))[0]
+
+
 def _float_array(points: list[dict[str, float | str]], name: str) -> str:
-    return " ".join(f"{float(point[name]):.9g}" for point in points)
+    return " ".join(f"{_safe_float(point[name]):.9g}" for point in points)
 
 
 def _write_xml(path: Path, root: ET.Element) -> None:

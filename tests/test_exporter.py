@@ -6,7 +6,7 @@ from zigbee_activity_viewer import ExportConfig, export_activity_fields
 from zigbee_activity_viewer.cli import main
 
 
-def _write_sample_csv(path: Path) -> None:
+def _write_sample_csv(path: Path, *, include_score: bool = True) -> None:
     rows = [
         {
             "time_rel": "0.0",
@@ -15,8 +15,7 @@ def _write_sample_csv(path: Path) -> None:
             "PacketLength": "64",
             "Timedeltafrompreviouscapturedframe": "0.5",
             "Wpan_Security": "1",
-            "transformer_ids_score": "0.05",
-            "target": "normal",
+            "target": "device_announce",
         },
         {
             "time_rel": "2.0",
@@ -25,10 +24,13 @@ def _write_sample_csv(path: Path) -> None:
             "PacketLength": "128",
             "Timedeltafrompreviouscapturedframe": "0.25",
             "ZBEENWK_Frame_type": "1",
-            "transformer_ids_score": "0.91",
-            "target": "attack",
+            "target": "data_transmission",
         },
     ]
+    if include_score:
+        rows[0]["transformer_ids_score"] = "0.05"
+        rows[1]["transformer_ids_score"] = "0.91"
+
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=sorted({key for row in rows for key in row}))
         writer.writeheader()
@@ -52,23 +54,59 @@ def test_export_activity_fields_writes_paraview_files(tmp_path: Path) -> None:
     with outputs["csv"].open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     assert rows[1]["score_norm"] == "1.0"
+    assert rows[0]["activity_label"] == "device_announce"
+    assert rows[1]["activity_label"] == "data_transmission"
     assert rows[0]["protocol_family"] == "zigbee_encrypted"
 
     vtp_root = ET.parse(outputs["vtp"]).getroot()
     assert vtp_root.attrib["type"] == "PolyData"
     assert vtp_root.find(".//Piece").attrib["NumberOfPoints"] == "2"
+    assert vtp_root.find(".//DataArray[@Name='activity_id']") is not None
 
     vti_root = ET.parse(outputs["vti"]).getroot()
     assert vti_root.attrib["type"] == "ImageData"
     assert vti_root.find(".//DataArray[@Name='packet_count']") is not None
+    assert vti_root.find(".//DataArray[@Name='dominant_activity_id']") is not None
 
 
-def test_cli_exports_files(tmp_path: Path) -> None:
+def test_target_column_is_activity_class_when_no_score_exists(tmp_path: Path) -> None:
+    input_csv = tmp_path / "activity_only.csv"
+    _write_sample_csv(input_csv, include_score=False)
+
+    outputs = export_activity_fields(input_csv, tmp_path / "out", ExportConfig(volume_bins=(3, 3, 3)))
+
+    with outputs["csv"].open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["score"] == ""
+    assert rows[0]["color_value"] == rows[0]["activity_id"]
+    assert rows[1]["color_value"] == rows[1]["activity_id"]
+    assert {row["activity_label"] for row in rows} == {"device_announce", "data_transmission"}
+
+
+def test_cli_exports_files_with_dataset_column_names(tmp_path: Path) -> None:
     input_csv = tmp_path / "capture.csv"
     output_dir = tmp_path / "cli_out"
-    _write_sample_csv(input_csv)
+    _write_sample_csv(input_csv, include_score=False)
 
-    status = main([str(input_csv), "--output-dir", str(output_dir), "--volume-bins", "3,3,3"])
+    status = main(
+        [
+            str(input_csv),
+            "--output-dir",
+            str(output_dir),
+            "--time-column",
+            "time_rel",
+            "--source-column",
+            "LayerZBEENWKSource",
+            "--destination-column",
+            "LayerZBEENWKDestination",
+            "--length-column",
+            "PacketLength",
+            "--target-column",
+            "target",
+            "--volume-bins",
+            "3,3,3",
+        ]
+    )
 
     assert status == 0
     assert (output_dir / "capture_activity_points.vtp").exists()

@@ -17,7 +17,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--time-column", default="time_rel", help="Column used as the temporal/x coordinate.")
     parser.add_argument("--source-column", default="LayerZBEENWKSource", help="Source address/role column used for the y coordinate.")
     parser.add_argument("--destination-column", default="LayerZBEENWKDestination", help="Destination address/role column used for the z coordinate.")
-    parser.add_argument("--score-column", default=None, help="Anomaly score column to color by; auto-detected when omitted.")
+    parser.add_argument("--length-column", default="PacketLength", help="Packet or flow length column used for byte totals.")
+    parser.add_argument("--target-column", default="target", help="Activity class column; used as categorical color when no score column exists.")
+    parser.add_argument("--score-column", default=None, help="Optional numeric model score column to color by; activity class is used when omitted and no score column is auto-detected.")
     parser.add_argument("--volume-bins", default="96,32,32", help="VTI grid bins as nx,ny,nz.")
     return parser
 
@@ -36,6 +38,8 @@ def main(argv: list[str] | None = None) -> int:
         time_column=args.time_column,
         source_column=args.source_column,
         destination_column=args.destination_column,
+        length_column=args.length_column,
+        target_column=args.target_column,
         score_column=args.score_column,
         volume_bins=_parse_bins(args.volume_bins),
     )
