@@ -59,6 +59,36 @@ pvpython paraview_exports/activity_model_frame_paraview_scene.py
 
 If `--score-column` is omitted, the exporter searches only for numeric model fields: `anomaly_score`, `autoencoder_score`, `isolation_forest_score`, `transformer_ids_score`, and `attention_weight`. The `target` column is treated as an activity class label, not as a numeric score.
 
+## Reusing Random Forest / XGBoost activity models
+
+For Random Forest, XGBoost, or any other pickle-compatible estimator, treat each activity target/class as its own model slot. If only the activity class changes while the feature columns stay the same, train one model for each class and save it under that class name. Later runs can look up the same `(target_column, activity_class, model_kind, feature_columns, training_fingerprint)` and reuse the saved artifact instead of retraining.
+
+```python
+from pathlib import Path
+from zigbee_activity_viewer import ModelRegistry, fingerprint_file, get_or_train_pickle_model
+
+registry = ModelRegistry(Path("model_registry"))
+features = ("time_rel", "LayerZBEENWKSource", "LayerZBEENWKDestination", "PacketLength")
+fingerprint = fingerprint_file(
+    Path("activity_model_frame.csv"),
+    extra_values=("target", "device_announce", "random_forest", *features),
+)
+
+model, record, reused = get_or_train_pickle_model(
+    registry,
+    target_column="target",
+    activity_class="device_announce",
+    model_kind="random_forest",
+    feature_columns=features,
+    training_fingerprint=fingerprint,
+    train_model=lambda: train_random_forest_for_device_announce(),
+)
+print("reused saved model:", reused)
+print("model artifact:", registry.resolve_artifact(record))
+```
+
+Use `model_kind="xgboost"` for an XGBoost classifier/regressor. The registry does not train models itself; it saves and reuses the trained estimator you return from `train_model`, so it works with scikit-learn Random Forests, XGBoost models, or custom estimators as long as they can be pickled.
+
 ## ParaView visualization code
 
 The generated `*_paraview_scene.py` is executable ParaView Python code. Run it with `pvpython` to load the VTP point cloud and VTI volume, color the point cloud by `activity_id`, color the volume by `dominant_activity_id`, add an outline, set the camera, and write both `*_paraview_scene.png` and `*_paraview_scene.pvsm`. You can also open the script in ParaView's Python Shell if you prefer an interactive session.
